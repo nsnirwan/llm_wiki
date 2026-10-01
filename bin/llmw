@@ -1,0 +1,586 @@
+#!/usr/bin/env bash
+# llmw — project context manager
+# Hub: the repo containing this script.
+set -uo pipefail
+
+HUB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+DATE="$(date +%Y-%m-%d)"
+
+# Walk up from cwd to find a project root (.context/ or .git/)
+find_root() {
+  local d="${1:-$PWD}"
+  while [ "$d" != "/" ]; do
+    [ -d "$d/.context" ] && { echo "$d"; return 0; }
+    d="$(dirname "$d")"
+  done
+  d="${1:-$PWD}"
+  while [ "$d" != "/" ]; do
+    [ -d "$d/.git" ] && { echo "$d"; return 0; }
+    d="$(dirname "$d")"
+  done
+  return 1
+}
+
+die() { echo "llmw: $*" >&2; exit 1; }
+
+# Strip HTML comments. Handles same-line <!-- ... --> correctly, which a naive
+# `sed '/<!--/,/-->/d'` does not (it would delete through to EOF).
+strip_comments() {
+  awk '
+    { line=$0 }
+    line ~ /<!--/ && line ~ /-->/ { next }          # whole comment on one line
+    line ~ /<!--/ { inc=1; next }
+    inc && line ~ /-->/ { inc=0; next }
+    !inc { print }
+  '
+}
+
+# ---------------------------------------------------------------- init
+cmd_init() {
+  local root name
+  root="$(find_root)" || die "not inside a git repo or project directory"
+  name="$(basename "$root")"
+
+  mkdir -p "$root/.context"
+  local branch made=0 f
+  branch="$(git -C "$root" branch --show-current 2>/dev/null || echo main)"
+  for f in state overview rules constraints glossary features decisions lessons log index; do
+    if [ ! -f "$root/.context/$f.md" ]; then
+      sed -e "s|{{PROJECT_NAME}}|$name|g" \
+          -e "s|{{DATE}}|$DATE|g" \
+          -e "s|{{BRANCH}}|$branch|g" \
+          "$HUB/templates/context/$f.md" > "$root/.context/$f.md"
+      echo "llmw: created .context/$f.md"
+      made=$((made+1))
+    fi
+  done
+  if [ "$made" -eq 0 ]; then
+    echo "llmw: .context/ already complete (10 files)"
+  else
+    echo "llmw: backfilled $made file(s) in $root/.context/"
+  fi
+
+  # standards: symlink so there is exactly ONE copy, in the hub
+  if [ ! -e "$root/.context/standards" ]; then
+    ln -s "$HUB/standards" "$root/.context/standards"
+    echo "llmw: linked standards -> $HUB/standards"
+  fi
+
+  if [ ! -f "$root/CLAUDE.md" ]; then
+    sed -e "s|{{PROJECT_NAME}}|$name|g" "$HUB/templates/CLAUDE.md" > "$root/CLAUDE.md"
+    echo "llmw: created $root/CLAUDE.md  (fill in the stack/run/test lines)"
+  elif ! grep -q '^@\.context/standards/00-core\.md' "$root/CLAUDE.md"; then
+    cp "$root/CLAUDE.md" "$root/CLAUDE.md.bak"
+    { printf '@.context/standards/00-core.md\n@.context/standards/10-code.md\n@.context/standards/20-safety.md\n\n'
+      cat "$root/CLAUDE.md.bak"; } > "$root/CLAUDE.md"
+    echo "llmw: CLAUDE.md kept, standards imports prepended (backup: CLAUDE.md.bak)"
+  else
+    echo "llmw: CLAUDE.md already imports the standards — unchanged"
+  fi
+
+  # hub project page
+  mkdir -p "$HUB/projects"
+  if [ ! -f "$HUB/projects/$name.md" ]; then
+    {
+      echo "# $name"
+      echo
+      echo "- **Path:** \`$root\`"
+      echo "- **Added:** $DATE"
+      echo "- **Status:** active"
+      echo
+      echo "## Summary"
+      echo
+      echo "(one paragraph)"
+      echo
+      echo "## Live state"
+      echo
+      echo "<!-- llmw sync fills this -->"
+    } > "$HUB/projects/$name.md"
+    echo "llmw: created hub page $HUB/projects/$name.md"
+  fi
+
+  # git post-commit hook
+  local hookdir="$root/.git/hooks"
+  if [ -d "$hookdir" ] && [ ! -f "$hookdir/post-commit" ]; then
+    cat > "$hookdir/post-commit" <<'HOOK'
+#!/usr/bin/env bash
+root="$(git rev-parse --show-toplevel)"
+[ -f "$root/.context/log.md" ] || exit 0
+printf '\n## [%s] commit | %s\n\n- `%s` %s\n' \
+  "$(date +%Y-%m-%d)" "$(git log -1 --pretty=%s)" \
+  "$(git log -1 --pretty=%h)" "$(git log -1 --pretty='%s (%an)')" \
+  >> "$root/.context/log.md"
+HOOK
+    chmod +x "$hookdir/post-commit"
+    echo "llmw: installed git post-commit log hook"
+  fi
+
+  echo
+  echo "Next: 1) fill in CLAUDE.md   2) fill in .context/overview.md and state.md"
+  echo "      3) git add .context CLAUDE.md && git commit -m 'chore: add project context'"
+}
+
+# -------------------------------------------------- session-start (hook)
+# stdout of this command is injected into Claude's context.
+cmd_session_start() {
+  cat >/dev/null 2>&1 || true   # drain hook JSON on stdin
+  local root; root="$(find_root)" || exit 0
+  [ -d "$root/.context" ] || exit 0
+
+  echo "=== PROJECT CONTEXT (auto-loaded, do not re-explore) ==="
+  echo "project: $(basename "$root")   path: $root"
+  if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "branch:  $(git -C "$root" branch --show-current 2>/dev/null)"
+    local dirty; dirty="$(git -C "$root" status --porcelain 2>/dev/null | head -12)"
+    if [ -n "$dirty" ]; then
+      echo "uncommitted changes:"; echo "$dirty" | sed 's/^/  /'
+    else
+      echo "working tree: clean"
+    fi
+    echo "recent commits:"
+    git -C "$root" log -3 --pretty='  %h %s (%ar)' 2>/dev/null
+  fi
+
+  if [ -f "$root/.context/state.md" ]; then
+    echo
+    echo "--- .context/state.md ---"
+    strip_comments < "$root/.context/state.md" | sed '/^$/N;/^\n$/D'
+  fi
+
+  if [ -f "$root/.context/log.md" ]; then
+    echo
+    echo "--- last 5 log entries ---"
+    grep '^## \[' "$root/.context/log.md" | tail -5
+  fi
+
+  # Standing rules — Tier 1. Cheap (~150 tok) and the highest-value content we have:
+  # one-line imperatives learned from real breakage. Must not depend on the agent
+  # choosing to open lessons.md.
+  if [ -f "$root/.context/lessons.md" ]; then
+    local rules
+    rules="$(awk '/^## Standing rules/{f=1;next} /^---/{f=0} /^## /{if(f)f=0} f' \
+              "$root/.context/lessons.md" \
+            | strip_comments | grep '^- ' | head -20)"
+    if [ -n "$rules" ]; then
+      echo
+      echo "--- STANDING RULES (learned from past incidents — these are binding) ---"
+      echo "$rules"
+    fi
+  fi
+
+  echo
+  echo "Other context available on demand (read only if the task needs it):"
+  echo "  .context/overview.md  .context/rules.md  .context/decisions.md  .context/log.md"
+  echo "=== END PROJECT CONTEXT ==="
+}
+
+# ---------------------------------------------------- session-end (hook)
+cmd_session_end() {
+  cat >/dev/null 2>&1 || true
+  local root; root="$(find_root)" || exit 0
+  [ -f "$root/.context/log.md" ] || exit 0
+
+  local since commits
+  since="$(date -d '12 hours ago' +%Y-%m-%dT%H:%M:%S 2>/dev/null || date -v-12H +%Y-%m-%dT%H:%M:%S 2>/dev/null)"
+  commits="$(git -C "$root" log --since="$since" --pretty='  - `%h` %s' 2>/dev/null | head -20)"
+  [ -z "$commits" ] && exit 0
+
+  # don't double-log if the last entry is already today's session
+  if grep -q "^## \[$DATE\] session" "$root/.context/log.md" 2>/dev/null; then exit 0; fi
+
+  {
+    echo
+    echo "## [$DATE] session | $(git -C "$root" branch --show-current 2>/dev/null)"
+    echo
+    echo "$commits"
+  } >> "$root/.context/log.md"
+}
+
+# ----------------------------------------------------------------- log
+cmd_log() {
+  local root; root="$(find_root)" || die "no project found"
+  [ $# -gt 0 ] || die "usage: llmw log <message>"
+  { echo; echo "## [$DATE] note | $*"; } >> "$root/.context/log.md"
+  echo "llmw: logged"
+}
+
+# ---------------------------------------------------------------- sync
+# Pull each project's state into the hub index.
+cmd_sync() {
+  local out="$HUB/index.md"
+  {
+    echo "# Project Index"
+    echo
+    echo "_Generated by \`llmw sync\` on $DATE. Do not edit by hand._"
+    echo
+    echo "| Project | Branch | Right now | Next step | Last activity |"
+    echo "|---|---|---|---|---|"
+  } > "$out"
+
+  local page path name
+  for page in "$HUB"/projects/*.md; do
+    [ -e "$page" ] || continue
+    name="$(basename "$page" .md)"
+    path="$(grep -m1 '^\- \*\*Path:\*\*' "$page" | sed 's/.*`\(.*\)`.*/\1/')"
+    if [ -z "$path" ] || [ ! -d "$path/.context" ]; then
+      echo "| [$name](projects/$name.md) | - | _not found_ | - | - |" >> "$out"
+      continue
+    fi
+    local branch now next last
+    branch="$(git -C "$path" branch --show-current 2>/dev/null || echo '-')"
+    now="$(awk '/^## Right now/{f=1;next} /^## /{f=0} f && /^- /{sub(/^- /,"");print;exit}' "$path/.context/state.md" 2>/dev/null)"
+    next="$(awk '/^## Next step/{f=1;next} /^## /{f=0} f && /^1\./{sub(/^1\. */,"");print;exit}' "$path/.context/state.md" 2>/dev/null)"
+    last="$(grep '^## \[' "$path/.context/log.md" 2>/dev/null | tail -1 | sed 's/^## //; s/|/\\|/g')"
+    echo "| [$name](projects/$name.md) | $branch | ${now:-–} | ${next:-–} | ${last:-–} |" >> "$out"
+  done
+  echo "llmw: wrote $out"
+  cat "$out"
+}
+
+# ---------------------------------------------------------------- lint
+cmd_lint() {
+  local root; root="$(find_root)" || die "no project found"
+  local c="$root/.context" issues=0
+  echo "llmw lint: $root"
+  for f in state overview rules decisions log; do
+    [ -f "$c/$f.md" ] || { echo "  MISSING  .context/$f.md"; issues=$((issues+1)); }
+  done
+  if [ -f "$c/state.md" ]; then
+    local age_days
+    age_days=$(( ( $(date +%s) - $(stat -c %Y "$c/state.md" 2>/dev/null || stat -f %m "$c/state.md") ) / 86400 ))
+    [ "$age_days" -gt 7 ] && { echo "  STALE    state.md not updated in $age_days days"; issues=$((issues+1)); }
+    grep -q '{{' "$c/state.md" && { echo "  TEMPLATE state.md still has unfilled {{placeholders}}"; issues=$((issues+1)); }
+  fi
+  for f in overview rules; do
+    grep -q '{{\|^(one paragraph)\|^| | |' "$c/$f.md" 2>/dev/null && { echo "  EMPTY    $f.md is still mostly template"; issues=$((issues+1)); }
+  done
+  local wc; wc=$(wc -l < "$root/CLAUDE.md" 2>/dev/null || echo 0)
+  [ "$wc" -gt 80 ] && { echo "  BLOAT    CLAUDE.md is $wc lines — it loads on every turn, trim it"; issues=$((issues+1)); }
+  [ "$issues" -eq 0 ] && echo "  clean"
+  echo "$issues issue(s)"
+}
+
+# -------------------------------------------------------------- status
+# Health of the whole system: is every project's context actually current?
+cmd_status() {
+  local now; now=$(date +%s)
+  printf "%-20s %-10s %-8s %-8s %-8s %s\n" PROJECT BRANCH STATE LOG COMMIT VERDICT
+  printf "%-20s %-10s %-8s %-8s %-8s %s\n" -------------------- ---------- -------- -------- -------- -------
+  local page name path stale_days log_days commit_days branch verdict rc=0
+  for page in "$HUB"/projects/*.md; do
+    [ -e "$page" ] || continue
+    name="$(basename "$page" .md)"
+    path="$(grep -m1 '^\- \*\*Path:\*\*' "$page" | sed 's/.*`\(.*\)`.*/\1/')"
+    if [ -z "$path" ] || [ ! -d "$path/.context" ]; then
+      printf "%-20s %-10s %-8s %-8s %-8s %s\n" "$name" - - - - "MISSING"; rc=1; continue
+    fi
+    branch="$(git -C "$path" branch --show-current 2>/dev/null || echo -)"
+    stale_days=$(( (now - $(stat -c %Y "$path/.context/state.md" 2>/dev/null || stat -f %m "$path/.context/state.md" 2>/dev/null || echo "$now")) / 86400 ))
+    log_days=$(( (now - $(stat -c %Y "$path/.context/log.md" 2>/dev/null || stat -f %m "$path/.context/log.md" 2>/dev/null || echo "$now")) / 86400 ))
+    commit_days=$(( (now - $(git -C "$path" log -1 --format=%ct 2>/dev/null || echo "$now")) / 86400 ))
+
+    if [ ! -x "$path/.git/hooks/post-commit" ]; then
+      verdict="NO GIT HOOK"; rc=1
+    elif [ "$stale_days" -gt "$((commit_days + 3))" ]; then
+      verdict="DRIFTED (code moved, state didn't)"; rc=1
+    elif [ "$commit_days" -gt 30 ]; then
+      verdict="dormant"
+    elif [ "$stale_days" -gt 14 ]; then
+      verdict="STALE"; rc=1
+    else
+      verdict="ok"
+    fi
+    printf "%-20s %-10s %-8s %-8s %-8s %s\n" "$name" "$branch" "${stale_days}d" "${log_days}d" "${commit_days}d" "$verdict"
+  done
+  echo
+  echo "STATE/LOG/COMMIT = days since last change.  DRIFTED means commits are newer than state.md."
+  [ "$rc" -ne 0 ] && echo "Fix: cd into the project, run /catchup then /wrap."
+  return 0
+}
+
+# -------------------------------------------------------------- doctor
+# Is the plumbing actually installed?
+cmd_doctor() {
+  local ok=0 fail=0 CFG
+  CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+  chk() { if eval "$2"; then echo "  ok    $1"; ok=$((ok+1)); else echo "  FAIL  $1"; echo "        → $3"; fail=$((fail+1)); fi; }
+
+  echo "Install check (hub: $HUB)"
+  [ "$CFG" != "$HOME/.claude" ] && echo "  (profile config dir: $CFG)"
+  chk "llmw on PATH"            'command -v llmw >/dev/null'            "ln -s $HUB/bin/llmw /usr/local/bin/llmw"
+  chk "slash commands linked"   '[ -e "$CFG/commands/wrap.md" ]' "ln -s $HUB/commands/*.md $CFG/commands/"
+  chk "code-explorer subagent"  '[ -e "$CFG/agents/code-explorer.md" ]' "ln -s $HUB/agents/code-explorer.md $CFG/agents/"
+  chk "SessionStart hook"       'grep -q "llmw session-start" "$CFG/settings.json" 2>/dev/null' "llmw-install  (or llmw-profile add <name> for a profile)"
+  chk "SessionEnd hook"         'grep -q "llmw session-end" "$CFG/settings.json" 2>/dev/null'  "llmw-install  (or llmw-profile add <name> for a profile)"
+  chk "hub is a git repo"       '[ -d "$HUB/.git" ]'                    "cd $HUB && git init && git add -A && git commit -m init"
+
+  local root
+  if root="$(find_root 2>/dev/null)" && [ -d "$root/.context" ]; then
+    echo
+    echo "Current project: $root"
+    chk "  .context/ present"     '[ -d "$root/.context" ]'                  "llmw init"
+    chk "  standards symlink"     '[ -L "$root/.context/standards" ]'        "llmw init"
+    chk "  CLAUDE.md present"     '[ -f "$root/CLAUDE.md" ]'                 "llmw init"
+    chk "  git post-commit hook"  '[ -x "$root/.git/hooks/post-commit" ]'    "llmw init"
+    chk "  CLAUDE.md imports standards" 'grep -q "^@\.context/standards/00-core\.md" "$root/CLAUDE.md" 2>/dev/null' "llmw init  (prepends them automatically)"
+    chk "  all 10 context files"  'n=0; for f in state overview rules constraints glossary features decisions lessons log index; do [ -f "$root/.context/$f.md" ] || n=1; done; [ "$n" -eq 0 ]' "llmw init  (backfills missing ones)"
+    chk "  context committed"     'git -C "$root" ls-files --error-unmatch .context/state.md >/dev/null 2>&1' "git add .context CLAUDE.md && git commit -m 'chore: context'"
+  fi
+  echo
+  echo "$ok ok, $fail failed"
+}
+
+# -------------------------------------------------------------- impact
+# GENERATED, never stored. Two independent signals:
+#   1. static  — who references this now
+#   2. history — what has historically changed WITH it (catches coupling greps miss)
+cmd_impact() {
+  local root; root="$(find_root)" || die "no project found"
+  local target="${1:-}"; [ -n "$target" ] || die "usage: llmw impact <file-or-module>"
+  cd "$root"
+
+  local base stem
+  base="$(basename "$target")"; stem="${base%.*}"
+  echo "IMPACT: $target"
+  echo
+
+  echo "── Static references (who mentions it now) ──"
+  local refs
+  refs="$(git grep -l -w -e "$stem" -- . 2>/dev/null | grep -v "^${target}$" | head -40)"
+  if [ -z "$refs" ]; then echo "  none found"; else
+    echo "$refs" | grep -iv 'test\|spec' | sed 's/^/  /'
+    local tests; tests="$(echo "$refs" | grep -i 'test\|spec')"
+    if [ -n "$tests" ]; then echo; echo "  tests covering it:"; echo "$tests" | sed 's/^/    /'; 
+    else echo; echo "  ⚠ No test names it directly — check the coupling section below for indirect coverage."; fi
+  fi
+  echo
+
+  echo "── Historical coupling (files that change WITH it) ──"
+  echo "   grep can't see this. High counts = hidden coupling."
+  git log --format=%H -- "$target" 2>/dev/null | head -40 | while read -r c; do
+    git show --name-only --format= "$c" 2>/dev/null
+  done | grep -v "^$" | grep -v "^${target}$" | sort | uniq -c | sort -rn | head -12 \
+    | awk '{printf "  %-3s co-changes  %s\n", $1, $2}'
+  echo
+
+  echo "── Scale ──"
+  printf "  referencing files: %s\n" "$(echo "$refs" | grep -c . )"
+  printf "  commits touching it: %s\n" "$(git log --oneline -- "$target" 2>/dev/null | wc -l)"
+  printf "  last changed: %s\n" "$(git log -1 --format='%ar by %an' -- "$target" 2>/dev/null || echo unknown)"
+  echo
+  echo "For precise symbol-level callers, use Serena/LSP. This shows repo-level blast radius."
+}
+
+# -------------------------------------------------------------- feature
+# Resolve a feature to its CURRENT files via the grep key in features.md.
+cmd_feature() {
+  local root; root="$(find_root)" || die "no project found"
+  local name="${1:-}"
+  local f="$root/.context/features.md"
+  [ -f "$f" ] || die "no .context/features.md — run llmw init"
+
+  if [ -z "$name" ]; then
+    echo "Features defined in features.md:"
+    awk -F'|' '/^\| [A-Za-z]/ && !/Feature *\|/ {gsub(/^ +| +$/,"",$2); if($2!="") print "  "$2}' "$f"
+    echo; echo "usage: llmw feature <name>"; return 0
+  fi
+
+  local row key entry module
+  row="$(grep -i "^| *$name *|" "$f" | head -1)"
+  [ -n "$row" ] || die "feature '$name' not in features.md — add a row for it"
+  entry="$(echo "$row" | awk -F'|' '{gsub(/^ +| +$|`/,"",$3); print $3}')"
+  module="$(echo "$row" | awk -F'|' '{gsub(/^ +| +$|`/,"",$4); print $4}')"
+  key="$(echo "$row" | awk -F'|' '{gsub(/^ +| +$|`/,"",$5); print $5}' | sed 's/ *, */|/g')"
+
+  echo "FEATURE: $name"
+  echo "  entry point: ${entry:-–}"
+  echo "  owning module: ${module:-–}"
+  echo "  grep key: ${key:-–}"
+  echo
+  [ -n "$key" ] || { echo "No grep key defined — add one to features.md."; return 0; }
+  echo "── Files currently implementing it (live, not stored) ──"
+  ( cd "$root" && git grep -lE "$key" 2>/dev/null | head -30 | sed 's/^/  /' ) || echo "  none"
+  echo
+  echo "── Notes from features.md ──"
+  awk -v n="$name" 'BEGIN{IGNORECASE=1} $0 ~ "^### *"n"$"{f=1;next} /^### /{f=0} f' "$f" | sed 's/^/  /'
+}
+
+# --------------------------------------------------------------- todos
+# Derived project health. Do not maintain a TODO document — the code IS the document.
+cmd_todos() {
+  local root; root="$(find_root)" || die "no project found"
+  cd "$root"
+  echo "DERIVED DEBT — $(basename "$root")"
+  echo
+  local tag n
+  for tag in FIXME HACK XXX TODO; do
+    n="$(git grep -cE "(#|//|/\*|<!--) *$tag" 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"
+    printf "  %-8s %s\n" "$tag" "$n"
+  done
+  n="$(git grep -ciE '@?deprecated' 2>/dev/null | awk -F: '{s+=$2} END{print s+0}')"
+  printf "  %-8s %s\n" DEPRECATED "$n"
+  echo
+  echo "── FIXME / HACK / XXX (the ones that actually matter) ──"
+  git grep -nE "(#|//|/\*|<!--) *(FIXME|HACK|XXX)" 2>/dev/null | head -25 | sed 's/^/  /'
+  echo
+  echo "── Files with the most debt markers ──"
+  git grep -cE "(#|//|/\*|<!--) *(TODO|FIXME|HACK|XXX)" 2>/dev/null \
+    | awk -F: '{print $2, $1}' | sort -rn | head -8 | awk '{printf "  %-4s %s\n",$1,$2}'
+  echo
+  echo "Human-judgement debt (unsafe modules, risky areas) belongs in state.md, not here."
+}
+
+# ------------------------------------------------------------ timeline
+# Architecture evolution, derived from tagged ADRs. "When did this become X?"
+cmd_timeline() {
+  local root; root="$(find_root)" || die "no project found"
+  local f="$root/.context/decisions.md"
+  [ -f "$f" ] || die "no decisions.md"
+  echo "ARCHITECTURE TIMELINE — $(basename "$root")"
+  echo "(ADRs of type architecture/stack/data; run 'llmw timeline all' for everything)"
+  echo
+  awk -v mode="${1:-arch}" '
+    /^## \[/ { title=$0; sub(/^## /,"",title); status=""; type=""; next }
+    /^\- \*\*Status:\*\*/ { status=$0; sub(/.*Status:\*\* */,"",status) }
+    /^\- \*\*Type:\*\*/ {
+      type=$0; sub(/.*Type:\*\* */,"",type)
+      if (mode=="all" || type ~ /architecture|stack|data/) {
+        printf "  %-14s %-12s %s\n", type, "["status"]", title
+      }
+    }
+  ' "$f"
+  echo
+  echo "Untagged ADRs won't appear — add '- **Type:** architecture' to include them."
+}
+
+# --------------------------------------------------------------- adopt
+# New machine / moved directory: re-point the hub page at where this project
+# actually lives now, then repair everything else. Safe to run any time.
+cmd_adopt() {
+  local root name page
+  root="$(find_root)" || die "not inside a git repo or project directory"
+  name="$(basename "$root")"
+  page="$HUB/projects/$name.md"
+
+  if [ -f "$page" ]; then
+    local old
+    old="$(grep -m1 '^\- \*\*Path:\*\*' "$page" | sed 's/.*`\(.*\)`.*/\1/')"
+    if [ "$old" = "$root" ]; then
+      echo "llmw: hub page path already correct"
+    else
+      sed -i.bak "s|^- \*\*Path:\*\* .*|- **Path:** \`$root\`|" "$page" && rm -f "$page.bak"
+      echo "llmw: hub page re-pointed"
+      echo "        was: ${old:-<none>}"
+      echo "        now: $root"
+    fi
+  fi
+
+  # standards symlink may point at the OLD machine's hub — always refresh it
+  if [ -L "$root/.context/standards" ] || [ -e "$root/.context/standards" ]; then
+    rm -rf "$root/.context/standards"
+  fi
+
+  cmd_init
+}
+
+# --------------------------------------------------------------- brief
+# For surfaces with NO file access (claude.ai chat, ChatGPT, a coworker).
+# Emits a self-contained, paste-able context block.
+#   llmw brief | pbcopy      compact  (~1.5k tokens)
+#   llmw brief full | pbcopy adds rules.md + overview architecture (~3k)
+cmd_brief() {
+  local root; root="$(find_root)" || die "no project found"
+  local c="$root/.context" mode="${1:-compact}"
+
+  echo "=== PROJECT CONTEXT: $(basename "$root") ==="
+  echo "Generated $(date '+%Y-%m-%d %H:%M') by \`llmw brief\`. Treat as authoritative."
+  echo
+  echo "RULES OF ENGAGEMENT FOR THIS CONVERSATION:"
+  echo "- You do NOT have access to this repository. You cannot read files."
+  echo "- Everything you know about this project is in this message. Nothing else."
+  echo "- Do not invent file paths, function names, APIs, config keys or table names."
+  echo "  If it is not stated below, say \"I don't know — check the repo\" instead of guessing."
+  echo "- When you make a claim about this project, cite which section below it came from."
+  echo "- If I ask about something not covered here, ask me to paste the relevant file."
+  echo
+
+  if git -C "$root" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "## Repo state"
+    echo "- branch: $(git -C "$root" branch --show-current 2>/dev/null)"
+    echo "- recent commits:"
+    git -C "$root" log -5 --pretty='  - %s (%ar)' 2>/dev/null
+    echo
+  fi
+
+  if [ -f "$c/state.md" ]; then
+    echo "## Where we left off"; strip_comments < "$c/state.md" | tail -n +2 | sed '/^$/N;/^\n$/D'; echo
+  fi
+  if [ -f "$c/lessons.md" ]; then
+    local r
+    r="$(awk '/^## Standing rules/{f=1;next} /^---/{f=0} /^## /{if(f)f=0} f' "$c/lessons.md" | strip_comments | grep '^- ')"
+    [ -n "$r" ] && { echo "## Standing rules (binding — learned from real incidents)"; echo "$r"; echo; }
+  fi
+  if [ -f "$c/constraints.md" ]; then
+    echo "## Architectural constraints (violating these is a defect even if tests pass)"
+    strip_comments < "$c/constraints.md" | tail -n +2 | grep -v '^| *|' | sed '/^$/N;/^\n$/D'; echo
+  fi
+  if [ -f "$c/glossary.md" ]; then
+    echo "## Domain glossary"
+    strip_comments < "$c/glossary.md" | tail -n +2 | grep -v '^| *| *| *| *|' | sed '/^$/N;/^\n$/D'; echo
+  fi
+
+  if [ "$mode" = "full" ]; then
+    if [ -f "$c/rules.md" ]; then
+      echo "## Business rules"; strip_comments < "$c/rules.md" | tail -n +2 | sed '/^$/N;/^\n$/D'; echo
+    fi
+    if [ -f "$c/overview.md" ]; then
+      echo "## Architecture"
+      awk '/^## Architecture/{f=1;next} /^## /{f=0} f' "$c/overview.md" | strip_comments; echo
+    fi
+  else
+    echo "(Run \`llmw brief full\` to also include business rules and architecture.)"
+  fi
+  echo "=== END PROJECT CONTEXT ==="
+}
+
+# -------------------------------------------------------------- dispatch
+case "${1:-help}" in
+  init)          shift; cmd_init "$@" ;;
+  adopt)         shift; cmd_adopt "$@" ;;
+  session-start) shift; cmd_session_start "$@" ;;
+  session-end)   shift; cmd_session_end "$@" ;;
+  log)           shift; cmd_log "$@" ;;
+  sync)          shift; cmd_sync "$@" ;;
+  lint)          shift; cmd_lint "$@" ;;
+  status)        shift; cmd_status "$@" ;;
+  doctor)        shift; cmd_doctor "$@" ;;
+  impact)        shift; cmd_impact "$@" ;;
+  feature)       shift; cmd_feature "$@" ;;
+  todos)         shift; cmd_todos "$@" ;;
+  timeline)      shift; cmd_timeline "$@" ;;
+  brief)         shift; cmd_brief "$@" ;;
+  *)
+    cat <<HELP
+llmw — project context manager   (hub: $HUB)
+
+  llmw init            install .context/ + CLAUDE.md into the current project
+  llmw adopt           new machine / moved dir: re-point hub page here, then repair
+  llmw session-start   print compact context  (used by the SessionStart hook)
+  llmw session-end     append a factual session entry to the log
+  llmw log <msg>       append a note to this project's log
+  llmw sync            regenerate the hub index from all projects' state
+  llmw lint            check this project's context for staleness/gaps
+  llmw status          all projects: is every context current, or drifted?
+  llmw doctor          is the plumbing installed correctly?
+
+ derived (generated live, never stored):
+  llmw impact <path>   what breaks if I change this — static refs + historical coupling
+  llmw feature <name>  which files currently implement a feature
+  llmw todos           TODO/FIXME/HACK/deprecated debt, by count and by file
+  llmw timeline [all]  how the architecture evolved, from tagged ADRs
+
+ for surfaces with no file access (claude.ai chat, ChatGPT):
+  llmw brief [full]    paste-able context block  —  llmw brief | pbcopy
+HELP
+    ;;
+esac

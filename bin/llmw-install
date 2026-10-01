@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# One-shot installer. Run from anywhere: ~/projects/llm_wiki/bin/llmw-install
+set -uo pipefail
+
+HUB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
+echo "Installing llmw from hub: $HUB"
+echo
+
+# --- 1. CLI on PATH -----------------------------------------------------------
+BINDIR=""
+for d in /usr/local/bin "$HOME/.local/bin"; do
+  if [ -d "$d" ] && [ -w "$d" ]; then BINDIR="$d"; break; fi
+done
+if [ -z "$BINDIR" ]; then
+  mkdir -p "$HOME/.local/bin" && BINDIR="$HOME/.local/bin"
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) ;;
+    *) echo "NOTE: add this to your ~/.zshrc:  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+  esac
+fi
+# link every CLI in bin/ (llmw, llmw-profile, ...) — not just llmw
+for f in "$HUB"/bin/*; do
+  b="$(basename "$f")"
+  [ "$b" = "llmw-install" ] && continue      # installer stays where it is
+  [ -x "$f" ] || continue
+  ln -sf "$f" "$BINDIR/$b"
+  echo "  ok  $b -> $BINDIR/$b"
+done
+
+# --- 2. slash commands + subagent ---------------------------------------------
+CFG="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+mkdir -p "$CFG/commands" "$CFG/agents"
+for f in "$HUB"/commands/*.md; do ln -sf "$f" "$CFG/commands/$(basename "$f")"; done
+ln -sf "$HUB/agents/code-explorer.md" "$CFG/agents/code-explorer.md"
+echo "  ok  slash commands + code-explorer subagent linked"
+
+# --- 3. hooks (merged, never clobbering existing settings) --------------------
+python3 - "$HUB" "$CFG" <<'PY'
+import json, pathlib, sys, shutil
+hub, cfg = sys.argv[1], sys.argv[2]
+p = pathlib.Path(cfg) / "settings.json"
+p.parent.mkdir(parents=True, exist_ok=True)
+if p.exists():
+    shutil.copy(p, str(p) + ".bak")
+    try:
+        s = json.loads(p.read_text())
+    except json.JSONDecodeError:
+        print(f"  FAIL  {p} is not valid JSON — fix it, then re-run")
+        sys.exit(1)
+else:
+    s = {}
+cli = f"{hub}/bin/llmw"
+s.setdefault("hooks", {})
+s["hooks"]["SessionStart"] = [{
+    "matcher": "startup|resume|clear",
+    "hooks": [{"type": "command", "command": f"{cli} session-start"}],
+}]
+s["hooks"]["SessionEnd"] = [{"hooks": [{"type": "command", "command": f"{cli} session-end"}]}]
+p.write_text(json.dumps(s, indent=2) + "\n")
+print(f"  ok  SessionStart + SessionEnd hooks merged into {p}")
+PY
+
+echo
+echo "Verifying..."
+"$HUB/bin/llmw" doctor
+echo
+echo "Next: for each project you want to use, cd into it and run:  llmw adopt"
+echo "Multiple accounts on this machine?  llmw-profile add <name>"

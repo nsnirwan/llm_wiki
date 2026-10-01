@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# llmw-profile — run Claude Code under separate accounts on one machine.
+#
+# Each profile is its own CLAUDE_CONFIG_DIR: separate credentials, settings,
+# transcripts, commands and agents. Your PROJECT context is unaffected — it lives
+# in each repo's .context/, not in any account.
+set -uo pipefail
+
+HUB="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.." && pwd)"
+PREFIX="$HOME/.claude"
+
+die() { echo "llmw-profile: $*" >&2; exit 1; }
+dir_for() { echo "$PREFIX-$1"; }
+
+# Login state — best effort, and honest when it can't tell.
+# macOS keeps credentials in the Keychain under a service name derived from the
+# config dir, NOT in a file. Linux/Windows use $CONFIG_DIR/.credentials.json.
+# Returns: yes | no | unknown
+login_state() {
+  local d="$1"
+  [ -f "$d/.credentials.json" ] && { echo yes; return; }
+  if [ "$(uname -s)" = "Darwin" ] && command -v security >/dev/null 2>&1; then
+    local h
+    h="$(printf '%s' "$d" | shasum -a 256 2>/dev/null | cut -c1-8)"
+    if security find-generic-password -s "Claude Code-credentials-$h" >/dev/null 2>&1 \
+       || security find-generic-password -s "Claude Code-credentials-$d" >/dev/null 2>&1; then
+      echo yes; return
+    fi
+    # Keychain service naming has changed between versions — don't claim "no".
+    echo unknown; return
+  fi
+  echo no
+}
+
+# Install the llmw layer (commands, agents, hooks) into a config dir.
+# Without this a new profile has no /wrap, /preflight or SessionStart hook.
+provision() {
+  local d="$1"
+  mkdir -p "$d/commands" "$d/agents"
+  local f
+  for f in "$HUB"/commands/*.md; do ln -sf "$f" "$d/commands/$(basename "$f")"; done
+  ln -sf "$HUB/agents/code-explorer.md" "$d/agents/code-explorer.md"
+
+  # Share settings with the main profile so model/permissions/hooks stay in sync.
+  # Credentials live in a separate file, so this does NOT share the login.
+  if [ -f "$PREFIX/settings.json" ] && [ ! -e "$d/settings.json" ]; then
+    ln -sf "$PREFIX/settings.json" "$d/settings.json"
+    echo "  settings.json -> shared with main profile (login stays separate)"
+  elif [ ! -e "$d/settings.json" ]; then
+    python3 - "$HUB" "$d" <<'PY'
+import json, pathlib, sys
+hub, d = sys.argv[1], sys.argv[2]
+p = pathlib.Path(d) / "settings.json"
+cli = f"{hub}/bin/llmw"
+p.write_text(json.dumps({"hooks": {
+    "SessionStart": [{"matcher": "startup|resume|clear",
+                      "hooks": [{"type": "command", "command": f"{cli} session-start"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": f"{cli} session-end"}]}],
+}}, indent=2) + "\n")
+print("  settings.json -> created with llmw hooks")
+PY
+  fi
+  echo "  commands + code-explorer linked"
+}
+
+cmd_add() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: llmw-profile add <name>   (e.g. work, personal)"
+  local d; d="$(dir_for "$name")"
+  [ -d "$d" ] && echo "llmw-profile: '$name' exists — re-provisioning" || echo "llmw-profile: creating '$name' at $d"
+  mkdir -p "$d"
+  provision "$d"
+  echo
+  if [ "$(login_state "$d")" = "yes" ]; then
+    echo "Profile '$name' already has credentials — skipping login."
+  else
+    echo "Log in to the account you want for '$name' (a browser window opens)."
+    echo "Press enter to continue, or Ctrl-C to skip and log in on first use."
+    read -r _
+    CLAUDE_CONFIG_DIR="$d" claude /login
+  fi
+  echo
+  echo "Done. Use it with:  llmw-profile run $name     (or the 'cw' alias — see shell-init)"
+}
+
+cmd_list() {
+  printf "%-14s %-38s %-10s %s\n" PROFILE CONFIG_DIR LOGGED_IN LAST_USED
+  printf "%-14s %-38s %-10s %s\n" -------------- -------------------------------------- ---------- ---------
+  local d name logged last
+  for d in "$PREFIX"-*; do
+    [ -d "$d" ] || continue
+    name="${d#"$PREFIX"-}"
+    logged="$(login_state "$d")"
+    if [ -d "$d/projects" ]; then
+      last="$(find "$d/projects" -name '*.jsonl' -newermt '1970-01-01' -print0 2>/dev/null \
+              | xargs -0 ls -t 2>/dev/null | head -1)"
+      last="${last:+$(date -r "$last" '+%Y-%m-%d %H:%M' 2>/dev/null)}"
+    else last=""; fi
+    printf "%-14s %-38s %-10s %s\n" "$name" "$d" "$logged" "${last:-never}"
+  done
+  echo
+  echo "Main profile: $PREFIX  (used when CLAUDE_CONFIG_DIR is unset)"
+}
+
+cmd_run() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: llmw-profile run <name> [claude args...]"
+  shift
+  local d; d="$(dir_for "$name")"
+  [ -d "$d" ] || die "no profile '$name'. Create it: llmw-profile add $name"
+  # No login gate here on purpose: we cannot reliably detect Keychain credentials,
+  # and a wrong guess means being asked to log in on every launch. Claude Code
+  # prompts by itself when the profile genuinely needs auth.
+  echo "── claude [$name] ──" >&2
+  CLAUDE_CONFIG_DIR="$d" exec claude "$@"
+}
+
+cmd_doctor() {
+  local name="${1:-}"; [ -n "$name" ] || die "usage: llmw-profile doctor <name>"
+  local d; d="$(dir_for "$name")"
+  [ -d "$d" ] || die "no profile '$name'"
+  echo "Profile '$name' -> $d"
+  local ok=0 fail=0
+  c() { if eval "$2"; then echo "  ok    $1"; ok=$((ok+1)); else echo "  FAIL  $1"; echo "        -> $3"; fail=$((fail+1)); fi; }
+  local ls; ls="$(login_state "$d")"
+  case "$ls" in
+    yes)     echo "  ok    logged in"; ok=$((ok+1)) ;;
+    unknown) echo "  ?     logged in — can't tell (macOS Keychain); just run: llmw-profile run $name" ;;
+    *)       echo "  FAIL  logged in"; echo "        -> llmw-profile run $name   then /login"; fail=$((fail+1)) ;;
+  esac
+  c "slash commands"     '[ -e "$d/commands/wrap.md" ]'                                  "llmw-profile add $name"
+  c "code-explorer"      '[ -e "$d/agents/code-explorer.md" ]'                           "llmw-profile add $name"
+  c "SessionStart hook"  'grep -q "llmw session-start" "$d/settings.json" 2>/dev/null'   "llmw-profile add $name"
+  c "SessionEnd hook"    'grep -q "llmw session-end" "$d/settings.json" 2>/dev/null'     "llmw-profile add $name"
+  echo "  $ok ok, $fail failed"
+}
+
+cmd_shell_init() {
+  cat <<'EOF'
+# --- llmw profiles: add to ~/.zshrc, then `source ~/.zshrc` ---
+cw() {                       # cw work   |   cw personal
+  [ -n "${1:-}" ] || { llmw-profile list; return; }
+  local p="$1"; shift
+  llmw-profile run "$p" "$@"
+}
+# optional per-account shortcuts
+alias cwork='llmw-profile run work'
+alias cpers='llmw-profile run personal'
+EOF
+}
+
+case "${1:-help}" in
+  add)        shift; cmd_add "$@" ;;
+  list|ls)    shift; cmd_list "$@" ;;
+  run)        shift; cmd_run "$@" ;;
+  doctor)     shift; cmd_doctor "$@" ;;
+  shell-init) shift; cmd_shell_init "$@" ;;
+  *)
+    cat <<HELP
+llmw-profile — multiple Claude accounts on one machine
+
+  llmw-profile add <name>        create profile, install llmw layer, log in
+  llmw-profile list              profiles, login status, last used
+  llmw-profile run <name> [...]  launch claude under that account
+  llmw-profile doctor <name>     verify the llmw layer is installed there
+  llmw-profile shell-init        print shell functions (adds the 'cw' command)
+
+Setup once:
+  llmw-profile add work
+  llmw-profile add personal
+  llmw-profile shell-init >> ~/.zshrc && source ~/.zshrc
+
+Then, from inside any project:
+  cw work            # same repo, same .context/, different account
+
+Your project history is in each repo's .context/ — switching accounts never
+touches it. Only credentials and conversation transcripts are per-profile.
+HELP
+    ;;
+esac
